@@ -1,4 +1,6 @@
+import bisect
 import ctypes
+import json
 import os
 import random
 import re
@@ -22,6 +24,28 @@ MAX_PATH = 260
 PAGE = 0x1000
 CHUNK = 16 * 1024 * 1024
 MAX_MATCHES = 32
+POINTER_DEPTH = 5
+POINTER_SPREAD = 0x800
+POINTER_STRIDE = 4
+POINTER_NODES = 4096
+POINTER_PATHS = 6
+POINTER_BRANCH = 64
+POINTER_ANCHOR_BRANCH = 512
+POINTER_ANCHOR = 0x40000
+POINTER_TARGETS = 4
+POINTER_LADDER = ((5, 0x800), (7, 0x1000), (8, 0x2000))
+POINTER_PLAN = (
+    (5, 0x800, 0),
+    (7, 0x1000, 0),
+    (7, 0x1000, "block"),
+    (7, 0x1000, 0x10000),
+    (8, 0x2000, 0x80000),
+    (8, 0x2000, 0x400000),
+)
+POINTER_REACH = (0x10000, 0x80000, 0x400000, 0x4000000)
+POINTER_KEEP = 512
+POINTER_ROUNDS = 3
+STORE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "chains.json")
 GAME_PROCESS = re.compile(r"^(FiveM|RedM)(_b\d+)?_GTAProcess\.exe$", re.IGNORECASE)
 BYTE_TOKEN = re.compile(r"^(0x)?([0-9a-fA-F]{2}|\?\?|\?|\*|[0-9a-fA-F]{4,})$")
 STATIC_TARGET = re.compile(r"([\w.\-]+\.(?:exe|dll))\s*\+\s*(?:0x)?([0-9a-fA-F]+)", re.IGNORECASE)
@@ -41,6 +65,13 @@ WHITE = "\033[38;2;226;232;240m"
 kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
 advapi32 = ctypes.WinDLL("advapi32", use_last_error=True)
 psapi = ctypes.WinDLL("psapi", use_last_error=True)
+
+try:
+    import numpy
+except ImportError:
+    numpy = None
+
+POINTER_LIMIT = 40_000_000 if numpy is not None else 4_000_000
 
 
 class PROCESSENTRY32W(ctypes.Structure):
@@ -251,6 +282,15 @@ class Process:
                     result.append((name.value, info.lpBaseOfDll or 0, info.SizeOfImage))
         return result
 
+    def allocation(self, address):
+        """Start of the block the address was allocated in, so we can measure how deep inside it sits."""
+        info = MEMORY_BASIC_INFORMATION()
+        if not kernel32.VirtualQueryEx(
+            self.handle, ctypes.c_void_p(address), ctypes.byref(info), ctypes.sizeof(info)
+        ):
+            return None
+        return info.AllocationBase or info.BaseAddress or None
+
     def regions(self):
         info = MEMORY_BASIC_INFORMATION()
         address = 0
@@ -298,13 +338,8 @@ def parse_pattern(text):
     return re.compile(expression, re.DOTALL), len(tokens), wildcards
 
 
-def scan(process, blocks, pattern, length, progress=None):
-    buffer = (ctypes.c_ubyte * CHUNK)()
-    view = memoryview(buffer)
+def filler(process, buffer):
     done = ctypes.c_size_t(0)
-    total = sum(size for _, size in blocks)
-    scanned = 0
-    matches = []
 
     def fill(address, size):
         if kernel32.ReadProcessMemory(
@@ -322,6 +357,17 @@ def scan(process, blocks, pattern, length, progress=None):
             )
             if not ok or done.value != span:
                 ctypes.memset(ctypes.byref(buffer, offset), 0, span)
+
+    return fill
+
+
+def scan(process, blocks, pattern, length, progress=None):
+    buffer = (ctypes.c_ubyte * CHUNK)()
+    view = memoryview(buffer)
+    total = sum(size for _, size in blocks)
+    scanned = 0
+    matches = []
+    fill = filler(process, buffer)
 
     for base, size in blocks:
         offset = 0
@@ -510,6 +556,144 @@ def walk_chain(process, address, offsets):
     return steps, current
 
 
+class Pointers:
+    """Every aligned slot in the process that stores something looking like an address.
+
+    Built in a single memory pass, then queried in memory - walking one more level costs
+    a binary search, not another scan.
+    """
+
+    def __init__(self, process, blocks, progress=None):
+        self.size = process.pointer_size
+        self.low = min(base for base, _ in blocks)
+        self.high = max(base + span for base, span in blocks)
+        self.values = []
+        self.holders = []
+        self.count = 0
+        self.capped = False
+        self._collect(process, blocks, progress)
+        self._finish()
+
+    def _collect(self, process, blocks, progress):
+        buffer = (ctypes.c_ubyte * CHUNK)()
+        view = memoryview(buffer)
+        fill = filler(process, buffer)
+        total = sum(span for _, span in blocks)
+        scanned = 0
+        for base, span in blocks:
+            offset = 0
+            while offset < span:
+                window = min(CHUNK, span - offset)
+                fill(base + offset, window)
+                slots = window // self.size
+                if slots:
+                    self._absorb(view[: slots * self.size], base + offset)
+                scanned += window
+                if progress:
+                    progress(min(scanned, total), total)
+                if self.count > POINTER_LIMIT:
+                    self.capped = True
+                    return
+                offset += window
+
+    def _absorb(self, data, base):
+        if numpy is not None:
+            kind = numpy.uint64 if self.size == 8 else numpy.uint32
+            raw = numpy.frombuffer(data, dtype=kind).astype(numpy.int64)
+            keep = (raw >= self.low) & (raw <= self.high) & (raw % POINTER_STRIDE == 0)
+            picked = numpy.nonzero(keep)[0]
+            if picked.size:
+                self.values.append(raw[picked])
+                self.holders.append(base + picked * self.size)
+                self.count += int(picked.size)
+            return
+        for slot in range(len(data) // self.size):
+            start = slot * self.size
+            value = int.from_bytes(data[start : start + self.size], "little")
+            if self.low <= value <= self.high and not value % POINTER_STRIDE:
+                self.values.append(value)
+                self.holders.append(base + start)
+        self.count = len(self.values)
+
+    def _finish(self):
+        if numpy is not None:
+            if not self.values:
+                self.values = numpy.empty(0, dtype=numpy.int64)
+                self.holders = numpy.empty(0, dtype=numpy.int64)
+                return
+            self.values = numpy.concatenate(self.values)
+            self.holders = numpy.concatenate(self.holders)
+            order = numpy.argsort(self.values, kind="stable")
+            self.values = self.values[order]
+            self.holders = self.holders[order]
+            return
+        order = sorted(range(len(self.values)), key=self.values.__getitem__)
+        self.values = [self.values[index] for index in order]
+        self.holders = [self.holders[index] for index in order]
+
+    def locate(self, target, spread, limit):
+        """Slots holding a pointer that lands `0..spread` bytes below `target`, nearest first.
+
+        Nearest first matters: when the limit bites it has to drop the far-fetched
+        candidates, not the tight ones that look like real struct fields.
+        """
+        if numpy is not None:
+            start = int(numpy.searchsorted(self.values, target - spread, side="left"))
+            stop = int(numpy.searchsorted(self.values, target, side="right"))
+        else:
+            start = bisect.bisect_left(self.values, target - spread)
+            stop = bisect.bisect_right(self.values, target)
+        start = max(start, stop - limit)
+        found = [(int(self.holders[index]), target - int(self.values[index])) for index in range(stop - 1, start - 1, -1)]
+        return found
+
+
+def inside_module(modules, address):
+    return any(base <= address < base + size for _, base, size in modules)
+
+
+def pointer_scan(table, modules, target, depth, spread, anchor=0):
+    """`anchor` widens the first hop only: a value buried in a buffer is reached from the
+    front of that buffer, which can be far further away than a struct field ever is."""
+    nodes = [(target, None, None)]
+    frontier = [0]
+    complete = []
+    seen = {target}
+    for level in range(depth):
+        reach = max(spread, anchor) if not level else spread
+        branch = POINTER_ANCHOR_BRANCH if not level else POINTER_BRANCH
+        following = []
+        for parent in frontier:
+            for holder, offset in table.locate(nodes[parent][0], reach, branch):
+                static = inside_module(modules, holder)
+                if not static and holder in seen:
+                    continue
+                seen.add(holder)
+                index = len(nodes)
+                nodes.append((holder, offset, parent))
+                if static:
+                    complete.append(index)
+                else:
+                    following.append((offset, index))
+        following.sort()
+        frontier = [index for _, index in following[:POINTER_NODES]]
+        if complete or not frontier:
+            break
+    return nodes, complete
+
+
+def unwind(nodes, index):
+    offsets = []
+    address = nodes[index][0]
+    while True:
+        _, offset, parent = nodes[index]
+        if parent is None:
+            break
+        offsets.append(offset)
+        index = parent
+    return address, offsets
+
+
 def chain_expression(label, offsets):
     expression = f"[{label}]"
     for index, offset in enumerate(offsets):
@@ -652,14 +836,16 @@ def banner():
     print()
 
 
-def progress_bar(done, total):
+def progress_bar(done, total, label="scanning"):
     width = 30
     ratio = done / total if total else 1.0
     filled = int(width * ratio)
     bar = "".join(shade(index / width) + "=" for index in range(filled)) + DIM + "-" * (width - filled)
     percent = int(100 * ratio)
-    title(f"scanning {percent}%", percent)
-    print(f"\r{MARGIN}{DIM}scanning{RESET}  {bar}{RESET}  {WHITE}{percent:3d}%{RESET}", end="", flush=True)
+    title(f"{label} {percent}%", percent)
+    print(f"\r{MARGIN}{DIM}{fit(label, 10)}{RESET}{bar}{RESET}  {WHITE}{percent:3d}%{RESET}", end="", flush=True)
+
+
 
 
 def pulse(frame, cells=9):
@@ -816,6 +1002,244 @@ def reverse(process, modules, main, text):
     return signature
 
 
+def parse_pointer_request(text):
+    tokens = text.replace(",", " ").split()[1:]
+    if not tokens:
+        raise ScanError("usage: ptr <address> [depth N] [spread HEX] [as <name>]")
+    request = {"depth": POINTER_DEPTH, "spread": POINTER_SPREAD, "label": "manual"}
+    try:
+        address = int(tokens[0].lower().replace("0x", ""), 16)
+    except ValueError:
+        raise ScanError(f"invalid address: {tokens[0]}")
+    index = 1
+    while index < len(tokens):
+        token = tokens[index].lower()
+        if token == "as" and index + 1 < len(tokens):
+            request["label"] = " ".join(tokens[index + 1 :])
+            break
+        if token in ("depth", "spread") and index + 1 < len(tokens):
+            value = tokens[index + 1].lower().replace("0x", "")
+            request[token] = int(value) if token == "depth" else int(value, 16)
+            index += 2
+        else:
+            raise ScanError(f"unknown option: {tokens[index]}")
+    if not 1 <= request["depth"] <= 8:
+        raise ScanError("depth must be 1-8")
+    request["address"] = address
+    return request
+
+
+def pointer_table(process):
+    """One memory pass per command, reused by every level and every address after it."""
+    if numpy is None:
+        line(f"{YELLOW}numpy not installed - slow mode, try: pip install numpy{RESET}")
+    sys.stdout.write(HIDE)
+    started = time.time()
+    try:
+        table = Pointers(process, process.regions(), lambda done, total: progress_bar(done, total, "mapping"))
+    finally:
+        print(SHOW, end="")
+    note = f"{table.count} pointers   {time.time() - started:.1f}s"
+    if table.capped:
+        note += "   truncated"
+    print(f"\r{MARGIN}{DIM}{note}{RESET}" + " " * 40)
+    print()
+    return table
+
+
+def resolve_paths(process, modules, main, table, address, depth, spread, anchor=0):
+    nodes, complete = pointer_scan(table, modules, address, depth, spread, anchor)
+    paths = []
+    for index in complete:
+        base, offsets = unwind(nodes, index)
+        _, final = walk_chain(process, base, offsets)
+        if final != address:
+            continue
+        home = 0 if main[1] <= base < main[1] + main[2] else 1
+        paths.append((home, len(offsets), base, offsets))
+    paths.sort(key=lambda path: (path[0], path[1], max(path[3][:-1] or [0]), path[3]))
+    return paths
+
+
+def anchor_for(process, address):
+    """How far into its own allocation the value sits - the first hop has to cover that gap."""
+    base = process.allocation(address)
+    if not base or not 0 < address - base <= POINTER_ANCHOR:
+        return 0
+    return address - base
+
+
+def nearest_pointer(table, address):
+    """Closest pointer aimed below the value, however far - tells us what we are up against."""
+    found = table.locate(address, POINTER_REACH[-1], 1)
+    return found[0] if found else None
+
+
+def widen(process, modules, main, table, address, depth, spread):
+    """The table is already built, so a deeper walk is nearly free - keep going before giving up."""
+    measured = anchor_for(process, address)
+    if measured:
+        line(f"{DIM}value sits 0x{measured:X} into its block{RESET}")
+        print()
+    attempts = []
+    for deep, wide, reach in POINTER_PLAN:
+        step = (max(deep, depth), max(wide, spread), measured if reach == "block" else reach)
+        if step not in attempts:
+            attempts.append(step)
+    for deep, wide, reach in attempts:
+        paths = resolve_paths(process, modules, main, table, address, deep, wide, reach)
+        if paths:
+            if reach > wide:
+                line(f"{DIM}reached it from 0x{reach:X} back - the value sits inside a buffer{RESET}")
+                print()
+            return paths, deep
+        if reach:
+            line(f"{DIM}nothing within depth {deep} reaching 0x{reach:X} back - widening{RESET}")
+        else:
+            line(f"{DIM}nothing within depth {deep} - widening{RESET}")
+        print()
+    return [], attempts[-1][0]
+
+
+def pointer_panel(modules, address, paths, depth, rounds=1):
+    if not paths:
+        rows = [f" {DIM}no static pointer within depth {depth}{RESET}", ""]
+        rows.append(f" {DIM}the value may sit in a buffer nothing points straight at{RESET}")
+        rows.append(f" {DIM}widen it by hand: {RESET}ptr {address:X} depth 8 spread 2000{RESET}")
+        panel("NO PATH", rows, RED)
+        print()
+        return None
+    rows = []
+    for _, _, base, offsets in paths[:POINTER_PATHS]:
+        rows += path_rows(modules, base, offsets)
+    best = paths[0]
+    rows.append("")
+    rows += cheat_engine_rows(modules, best[2], best[3])
+    rows.append("")
+    rows.append(f" {DIM}0x{address:X}   {len(paths)} paths   depth {len(best[3])}{RESET}")
+    if rounds < POINTER_ROUNDS:
+        rows.append(f" {YELLOW}round {rounds} of {POINTER_ROUNDS} - restart the game and run this again{RESET}")
+    else:
+        rows.append(f" {GREEN}verified across {rounds} restarts - ready to use{RESET}")
+    panel("POINTER", rows, GREEN if rounds >= POINTER_ROUNDS else YELLOW)
+    print()
+    return chain_expression(static_name(modules, best[2]), best[3])
+
+
+def cheat_engine_rows(modules, base, offsets):
+    """Cheat Engine fills its offset boxes bottom up - the last hop goes in the top box."""
+    rows = [f" {DIM}Cheat Engine boxes, top to bottom{RESET}"]
+    for offset in reversed(offsets):
+        rows.append(f"   {WHITE}{offset:X}{RESET}")
+    rows.append(f"   {WHITE}{static_name(modules, base)}{RESET}   {DIM}base{RESET}")
+    return rows
+
+
+def path_rows(modules, base, offsets):
+    """Cheat Engine reads it as a base plus a list of offsets, and it fits the panel."""
+    rows = [f" {GREEN}>{RESET} {BOLD}{WHITE}{static_name(modules, base)}{RESET}"]
+    trail = [f"0x{offset:X}" for offset in offsets]
+    while trail:
+        take = 0
+        width = 0
+        while take < len(trail) and width + len(trail[take]) + 2 <= INNER - 8:
+            width += len(trail[take]) + 2
+            take += 1
+        rows.append(f"   {DIM}{'  '.join(trail[: take or 1])}{RESET}")
+        trail = trail[take or 1 :]
+    return rows
+
+
+def stored_paths(label):
+    try:
+        with open(STORE, encoding="utf-8") as handle:
+            saved = json.load(handle)
+    except Exception:
+        return {}, []
+    entry = saved.get(label) or {}
+    return saved, entry.get("paths", [])
+
+
+def keep_paths(label, saved, modules, paths, rounds):
+    saved[label] = {
+        "rounds": rounds,
+        "paths": [
+            {"base": static_name(modules, base), "offsets": [f"{offset:X}" for offset in offsets]}
+            for _, _, base, offsets in paths[:POINTER_KEEP]
+        ],
+    }
+    try:
+        with open(STORE, "w", encoding="utf-8") as handle:
+            json.dump(saved, handle, indent=1)
+    except Exception:
+        pass
+
+
+def survivors(process, modules, main, records, address):
+    """A path that still lands on the value after a restart is the one worth keeping."""
+    kept = []
+    for record in records:
+        try:
+            base, _ = parse_target(record["base"], modules, main)
+        except (ScanError, ValueError):
+            continue
+        offsets = [int(offset, 16) for offset in record["offsets"]]
+        _, final = walk_chain(process, base, offsets)
+        if final != address:
+            continue
+        home = 0 if main[1] <= base < main[1] + main[2] else 1
+        kept.append((home, len(offsets), base, offsets))
+    kept.sort()
+    return kept
+
+
+def chain_for(process, modules, main, address, label, depth=POINTER_DEPTH, spread=POINTER_SPREAD):
+    saved, records = stored_paths(label)
+    rounds = (saved.get(label) or {}).get("rounds", 0)
+    if records:
+        kept = survivors(process, modules, main, records, address)
+        if kept:
+            line(f"{DIM}{len(kept)} of {len(records)} saved paths survived - round {rounds + 1}{RESET}")
+            print()
+            keep_paths(label, saved, modules, kept, rounds + 1)
+            return pointer_panel(modules, address, kept, depth, rounds + 1)
+        line(f"{YELLOW}saved paths no longer reach the value - scanning again{RESET}")
+        print()
+    table = pointer_table(process)
+    paths, reached = widen(process, modules, main, table, address, depth, spread)
+    if paths:
+        keep_paths(label, saved, modules, paths, 1)
+        return pointer_panel(modules, address, paths, reached, 1)
+    return dead_end(modules, table, address, reached)
+
+
+def dead_end(modules, table, address, depth):
+    rows = [f" {DIM}no static pointer within depth {depth}{RESET}", ""]
+    close = nearest_pointer(table, address)
+    if close is None:
+        rows.append(f" {DIM}nothing in the process points anywhere near this value{RESET}")
+        rows.append(f" {DIM}it is loose data - chase the code that reads it instead{RESET}")
+    else:
+        holder, offset = close
+        rows.append(f" {DIM}closest pointer is 0x{offset:X} below it, held at {RESET}0x{holder:X}")
+        rows.append(f" {DIM}{static_name(modules, holder)}{RESET}")
+        if offset > POINTER_REACH[1]:
+            rows.append(f" {DIM}that is a long way - the value is deep inside a big buffer{RESET}")
+    panel("NO PATH", rows, RED)
+    print()
+    return None
+
+
+def pointer(process, modules, main, text):
+    request = parse_pointer_request(text)
+    address = request["address"]
+    if process.read_pointer(address) is None:
+        raise ScanError(f"cannot read 0x{address:X}")
+    if inside_module(modules, address):
+        raise ScanError(f"already static: {static_name(modules, address)}")
+    return chain_for(process, modules, main, address, request["label"], request["depth"], request["spread"])
+
+
 STACK = ("rsp", "rbp")
 
 
@@ -845,7 +1269,10 @@ def summary(expression, offsets):
 
 def show(process, modules, addresses, options, length):
     if not addresses:
-        panel("NO MATCH", [f" {DIM}-{RESET}"], RED)
+        rows = [f" {DIM}-{RESET}", ""]
+        rows.append(f" {DIM}nothing in the module or on the heap{RESET}")
+        rows.append(f" {DIM}the value may have moved - rescan in Cheat Engine{RESET}")
+        panel("NO MATCH", rows, RED)
         print()
         return None
     unique = {}
@@ -878,8 +1305,39 @@ def show(process, modules, addresses, options, length):
     return summary(expression, found)
 
 
+def sweep_for(process, blocks, pattern, length, label):
+    sys.stdout.write(HIDE)
+    started = time.time()
+    try:
+        addresses = scan(process, blocks, pattern, length, lambda done, total: progress_bar(done, total, label))
+    finally:
+        print(SHOW, end="")
+    megabytes = sum(size for _, size in blocks) / 1048576
+    print(f"\r{MARGIN}{DIM}{megabytes:.0f} MB   {time.time() - started:.2f}s{RESET}" + " " * 40)
+    print()
+    return addresses
+
+
+def chase(process, modules, main, addresses, options, label):
+    """Matches that live outside every module are data on the heap - chain them back to static."""
+    loose = []
+    for address in addresses[:POINTER_TARGETS]:
+        resolved = address + options["offset"]
+        if not inside_module(modules, resolved) and process.read_pointer(resolved) is not None:
+            loose.append(resolved)
+    if not loose:
+        return None
+    line(f"{DIM}heap address {RESET}")
+    print()
+    return chain_for(process, modules, main, loose[0], label)
+
+
 def handle(process, modules, main, raw):
     raw = raw.replace(",", " ").replace(";", " ").strip()
+    if raw.split()[0].lower() in ("ptr", "pointer"):
+        if not process.alive():
+            raise ScanError("process closed")
+        return pointer(process, modules, main, raw)
     if not BYTE_TOKEN.match(raw.split()[0]):
         return reverse(process, modules, main, raw)
     signature, extras = split_input(raw)
@@ -887,28 +1345,41 @@ def handle(process, modules, main, raw):
     options = parse_options(extras)
     if not process.alive():
         raise ScanError("process closed")
-    blocks = process.regions() if options["all"] else [(main[1], main[2])]
-    sys.stdout.write(HIDE)
-    started = time.time()
-    try:
-        addresses = scan(process, blocks, pattern, length, progress_bar)
-    finally:
-        print(SHOW, end="")
-    megabytes = sum(size for _, size in blocks) / 1048576
-    print(f"\r{MARGIN}{DIM}{megabytes:.0f} MB   {time.time() - started:.2f}s{RESET}" + " " * 40)
+    everywhere = options["all"]
+    blocks = process.regions() if everywhere else [(main[1], main[2])]
+    addresses = sweep_for(process, blocks, pattern, length, "module" if not everywhere else "process")
+    if not addresses and not everywhere:
+        line(f"{DIM}not in the main module {RESET}")
+        print()
+        everywhere = True
+        addresses = sweep_for(process, process.regions(), pattern, length, "process")
+    result = show(process, modules, addresses, options, length)
+    if addresses and everywhere and not options["rip"] and not options["chain"]:
+        return chase(process, modules, main, addresses, options, signature) or result
+    return result
+
+
+def hints():
+    line(f"{DIM}paste the AOB or ptr (addr) {RESET}")
     print()
-    return show(process, modules, addresses, options, length)
 
 
-def session(process, modules, main):
+def session(process, modules, main, name):
+    hints()
     while True:
-        raw = ask("Input Aob")
+        raw = ask("Input Aob / ptr")
         if not raw:
-            return
+            return process
         clear()
         banner()
-        panel("TARGET", process.card, GREEN)
-        print()
+        if process.alive():
+            panel("TARGET", process.card, GREEN)
+            print()
+        else:
+            line(f"{YELLOW}the game closed - waiting for it to come back{RESET}")
+            print()
+            process.close()
+            process, modules, main = attach(name)
         line(f"{CYAN}>{RESET} {DIM}{fit(raw, INNER).rstrip()}{RESET}")
         print()
         try:
@@ -936,7 +1407,7 @@ def main():
         line(str(error), RED)
         return 1
     try:
-        session(process, modules, image)
+        process = session(process, modules, image, name)
     finally:
         process.close()
     return 0
